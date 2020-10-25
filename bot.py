@@ -3,6 +3,9 @@ import os
 import discord
 from discord.ext import commands
 from fuzzywuzzy.process import extractOne as fuzzy_select
+from google.protobuf.json_format import MessageToDict
+
+from utils import extract_intent, remove_mentions
 
 
 token = os.environ.get('DISCORD_BOT_TOKEN')
@@ -11,6 +14,31 @@ token = os.environ.get('DISCORD_BOT_TOKEN')
 class OrginizerCog(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
+
+    @commands.Cog.listener()
+    async def on_message(self, message):
+        if message.author == self.bot.user:
+            return
+        content = remove_mentions(message.content)
+        response = extract_intent(message.author.id, content)
+        action = response.query_result.action
+        parameters = MessageToDict(response.query_result.parameters)
+        if action == 'play':
+            song = parameters['any']
+            source = discord.PCMVolumeTransformer(discord.FFmpegPCMAudio(song))
+            message.guild.voice_client.play(source, after=lambda e: print('Player error: %s' % e) if e else None)
+            await message.channel.send('Now playing: {}'.format(song))
+            return
+        else:
+            text_response = response.query_result.fulfillment_messages[0].text.text[0]
+            await message.channel.send(text_response)
+
+    @commands.Cog.listener()
+    async def on_command_error(self, ctx, err):
+        # To prevent discord.ext.commands.errors.CommandNotFound: errors
+        # caused by running of on_message instead of @commands.command()
+        if isinstance(err, commands.errors.CommandNotFound):
+            pass
 
     @commands.command()
     async def connect(self, ctx):
@@ -65,9 +93,11 @@ class OrginizerCog(commands.Cog):
 
 
 def main():
+    # By default the information about the guild members is not available
     # https://discordpy.readthedocs.io/en/latest/intents.html#where-d-my-members-go
     discord_intents = discord.Intents.default()
     discord_intents.members = True
+
     bot = commands.Bot(command_prefix=commands.when_mentioned_or('!'), intents=discord_intents)
 
     @bot.event
