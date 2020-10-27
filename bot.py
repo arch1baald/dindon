@@ -19,23 +19,41 @@ class OrginizerCog(commands.Cog):
     async def on_message(self, message):
         if message.author == self.bot.user:
             return
+        # Do not process messages without bot mention
+        # to optimize amount of queries to Dialogflow
+        for mention in message.mentions:
+            if mention == self.bot.user:
+                break
+        else:
+            return
         content = remove_mentions(message.content)
         response = extract_intent(message.author.id, content)
         action = response.query_result.action
         parameters = MessageToDict(response.query_result.parameters)
+        print(f'action: {action}, parameters: {parameters}')
         if action == 'play':
             song = parameters['any']
-            source = discord.PCMVolumeTransformer(discord.FFmpegPCMAudio(song))
-            message.guild.voice_client.play(source, after=lambda e: print('Player error: %s' % e) if e else None)
-            await message.channel.send('Now playing: {}'.format(song))
-            return
+            await self.play(ctx=message, query=song)
+        elif action == 'connect':
+            await self.connect(message)
+        elif action == 'move':
+            name = parameters['person']['name']
+            room = parameters['any']
+            query = f'{name} to {room}'
+            await self.move(ctx=message, query=query)
+        elif action == 'call':
+            name = parameters['any']
+            room = message.author.voice.channel.name
+            query = f'{name} to {room}'
+            # TODO: do not move users without accepts
+            await self.move(ctx=message, query=query)
         else:
             text_response = response.query_result.fulfillment_messages[0].text.text[0]
             await message.channel.send(text_response)
 
     @commands.Cog.listener()
     async def on_command_error(self, ctx, err):
-        # To prevent discord.ext.commands.errors.CommandNotFound: errors
+        # To prevent discord.ext.commands.errors.CommandNotFound errors
         # caused by running of on_message instead of @commands.command()
         if isinstance(err, commands.errors.CommandNotFound):
             pass
@@ -88,8 +106,12 @@ class OrginizerCog(commands.Cog):
     async def play(self, ctx, *, query):
         """Plays a file from the local filesystem"""
         source = discord.PCMVolumeTransformer(discord.FFmpegPCMAudio(query))
-        ctx.voice_client.play(source, after=lambda e: print('Player error: %s' % e) if e else None)
-        await ctx.send('Now playing: {}'.format(query))
+        try:
+            ctx.voice_client.play(source, after=lambda e: print('Player error: %s' % e) if e else None)
+            await ctx.send('Now playing: {}'.format(query))
+        except AttributeError:
+            ctx.guild.voice_client.play(source, after=lambda e: print('Player error: %s' % e) if e else None)
+            await ctx.channel.send('Now playing: {}'.format(query))
 
 
 def main():
