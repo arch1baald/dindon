@@ -1,14 +1,25 @@
+import asyncio
 import os
+import re
+import logging
 
 import discord
+from discord import Client, File
 from discord.ext import commands
 from fuzzywuzzy.process import extractOne as fuzzy_select
 from google.protobuf.json_format import MessageToDict
 
-from utils import extract_intent, remove_mentions
+from voice import DemultiplexerSink, Audio
+from utils import registry, extract_intent
+
+logger = logging.getLogger(__name__)
+token = os.getenv('DISCORD_BOT_TOKEN')
 
 
-token = os.environ.get('DISCORD_BOT_TOKEN')
+def remove_mentions(text):
+    text = re.sub(r'<@(everyone|here|[!&]?[0-9]{17,21})>', '', text)
+    text = text.strip()
+    return text
 
 
 class OrginizerCog(commands.Cog):
@@ -114,18 +125,120 @@ class OrginizerCog(commands.Cog):
             await ctx.channel.send('Now playing: {}'.format(query))
 
 
+class OrginizerBot(commands.bot.BotBase, Client):
+    def __init__(self):
+        # discord_intents = discord.Intents.default()
+        # discord_intents.members = True
+        super().__init__(
+            command_prefix=commands.when_mentioned_or('!'),
+            description='Orginizer bot that can talk with group of people',
+            # intents=discord_intents,
+        )
+        discord.opus.load_opus('/usr/local/Cellar/opus/1.3.1/lib/libopus.0.dylib')
+        print('OPUS:', discord.opus.is_loaded())
+        self.voice_bots = dict()
+
+    async def on_ready(self):
+        logger.info(f"Logged in as {self.user}")
+        channels = {channel.name: channel for channel in self.get_all_channels()}
+        handler = DiscordHandler(channels['boss-only'])
+        handler.setLevel(logging.INFO)
+        formatter = logging.Formatter('%(name)s: %(message)s')
+        handler.setFormatter(formatter)
+        for logger_name in ['discord', 'cities', 'akinator', 'googlesearch', 'parlai', 'youtubedl']:
+            logging.getLogger(logger_name).addHandler(handler)
+        logger.info(f"Guilds: {self.guilds}")
+        for guild in self.guilds:
+            logger.info(f"{guild.name} channels: {guild.channels}")
+            logger.info(f"{guild.name} voice channels: {guild.voice_channels}")
+            voice_channel = discord.utils.get(guild.voice_channels)
+            voice_client = await voice_channel.connect()
+            voice_bot = DemultiplexerSink(voice_client, [
+                'bumblebee',
+            ])
+            await voice_bot.start()
+            self.voice_bots[voice_channel] = voice_bot
+
+    async def on_guild_join(self, guild):
+        logger.debug(f"{self!r} joined {guild}")
+
+    async def on_group_join(self, channel, user):
+        logger.debug(f"{self!r} observed that {user} joined {channel}")
+
+    async def on_voice_state_update(self, user, old_state, new_state):
+        """ Вызывается, когда пользователь заходит на канал, включает / отключает звук или микрофон """
+        if user != self.user and old_state.channel is None and new_state.channel is not None:
+            await self.voice_bots[new_state.channel].on_welcome(user)
+
+
+class DialogflowCog(commands.Cog):
+    @commands.command()
+    async def join(self, ctx):
+        """Joins a voice channel"""
+
+        if ctx.voice_client.channel != ctx.author.voice.channel:
+            return await ctx.voice_client.move_to(ctx.author.voice.channel)
+
+    @commands.command()
+    async def stop(self, ctx):
+        """Stops and disconnects the bot from voice"""
+
+        await ctx.voice_client.disconnect()
+
+    @commands.command()
+    async def youtube_dl(self, ctx, url: str):
+        # TODO: how to get voice channel from text channel?
+        skill_ctx = ctx.bot.voice_bots[ctx.channel].users[ctx.author]
+        await registry.run_skill('youtube-dl', skill_ctx, ctx.author, url)
+
+    @commands.command()
+    async def parlai(self, ctx, model: str = 'reddit-2020-07-01'):
+        await registry.run_skill('parlai', )
+
+    @join.before_invoke
+    async def ensure_voice(self, ctx):
+        if ctx.voice_client is None:
+            if ctx.author.voice:
+                logger.debug(f'Joining channel {ctx.author.voice.channel!r}')
+                await ctx.author.voice.channel.connect()
+            else:
+                await ctx.send("You are not connected to a voice channel.")
+                raise commands.CommandError("Author not connected to a voice channel.")
+        elif ctx.voice_client.is_playing():
+            ctx.voice_client.stop()
+
+
+class DiscordHandler(logging.Handler):
+    def __init__(self, channel):
+        super().__init__()
+        self.channel = channel
+        self.loop = asyncio.get_running_loop()
+
+    async def send_message(self, speech: Audio, message: str):
+        await self.channel.send(f'```{message}```', file=speech and File(fp=speech.to_wav(), filename='speech.wav'))
+
+    def emit(self, record: logging.LogRecord):
+        asyncio.run_coroutine_threadsafe(
+            self.send_message(getattr(record, 'speech', None), self.format(record)), self.loop)
+
+
+def setup_logging():
+    logging.basicConfig(level=logging.INFO, format='%(asctime)-15s %(levelname)s[%(name)-20s] %(message)s')
+    logging.getLogger('discord.gateway').setLevel(logging.WARNING)
+    for level, name in logging._levelToName.items():
+        for logger_name in os.getenv(f'LOGGERS_{name}', '').split(','):
+            if logger_name:
+                logging.getLogger(logger_name).setLevel(level)
+
+
 def main():
     # By default the information about the guild members is not available
     # https://discordpy.readthedocs.io/en/latest/intents.html#where-d-my-members-go
-    discord_intents = discord.Intents.default()
-    discord_intents.members = True
-
-    bot = commands.Bot(command_prefix=commands.when_mentioned_or('!'), intents=discord_intents)
-
-    @bot.event
-    async def on_ready():
-        print('We have logged in as {0.user}'.format(bot))
-
+    # discord_intents = discord.Intents.default()
+    # discord_intents.members = True
+    setup_logging()
+    logger.info(f"Loaded skills: {list(registry.skills)}")
+    bot = OrginizerBot()
     bot.add_cog(OrginizerCog(bot))
     bot.run(token)
 
